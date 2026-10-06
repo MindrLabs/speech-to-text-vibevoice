@@ -1,0 +1,39 @@
+controller:
+  adapter:
+    type: http-server
+    port: ${env.PORT | 8101}
+    base_path: /api
+  webui:
+    driver: gradio
+    port: ${env.SERVER_PORT | 8102}
+
+workflows:
+  - id: transcribe
+    title: Speech to Text (VibeVoice ASR)
+    description: Long-form transcription with speaker attribution and timestamps using Microsoft's VibeVoice-ASR (non-streaming, up to 60-minute single-pass).
+    job:
+      input: ${input}
+      output:
+        transcription: ${output as json}
+
+component:
+  type: model
+  task: speech-to-text
+  driver: custom
+  family: vibevoice
+  model: microsoft/VibeVoice-ASR             # use microsoft/VibeVoice-ASR-Streaming-7B for incremental output
+  precision: auto
+  attn_implementation: sdpa
+  max_concurrent_count: 1
+  runtime:
+    type: virtualenv
+    driver: python
+    path: .venv/vibevoice
+    start_timeout: 30m                       # the first run installs torch into this venv
+  action:
+    audio: ${input.audio as audio}
+    context_info: ${input.context_info}      # optional hotwords, comma-separated
+    return_timestamps: true                  # false returns the transcript text only
+    temperature: 0.0
+    num_beams: 1
+    streaming: false
