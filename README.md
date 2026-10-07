@@ -4,9 +4,9 @@
 
 A speech recognition service: send a recording, get a transcript back. With enough memory, a meeting close to an hour long goes in whole, without cutting it into pieces.
 
-We served Microsoft's VibeVoice-ASR (8.7B) with model-compose and ran it on an RTX 4090 and an NVIDIA DGX Spark. We asked whether it runs on our hardware and, if so, what it does well and badly. We did not compare it with other models. The original weights do not fit on an Apple M2 16GB, so we ran the same recordings there with a third-party 4-bit MLX conversion and compared the results with the original (Section 2). We also tested the streaming model, VibeVoice-ASR-Streaming (Section 3.6).
+We served Microsoft's VibeVoice-ASR (8.7B) with model-compose and ran it on an RTX 4090 and an NVIDIA DGX Spark. We asked whether it runs on our hardware and, if so, what it does well and badly. We compared it with another model, Whisper large-v3, only on short read sentences (Section 3.4). The original weights do not fit on an Apple M2 16GB, so we ran the same recordings there with a third-party 4-bit MLX conversion and compared the results with the original (Section 2). We also tested the streaming model, VibeVoice-ASR-Streaming (Section 3.6).
 
-There were three kinds of input: Apollo 11 air-to-ground transcripts (NASA, public domain) read aloud by a TTS model, a public meeting recording (AMI), and NASA's public Artemis II press conference and 1962 radio recordings.
+There were three kinds of input: Apollo 11 air-to-ground transcripts (NASA, public domain) read aloud by a TTS model, a public meeting recording (AMI), and NASA's public Artemis II press conference and 1962 radio recordings. To let English, Korean and Chinese readers each find results for their own language, we also ran the same read sentences (FLEURS) in all three languages, and gave hotwords, code-switching and numbers the same tests in each language.
 
 A language model drafted the verdicts by reading each output next to the reference script, one author confirmed them, and we also measured character error rate (CER) and word error rate (WER).
 
@@ -25,9 +25,10 @@ Demo: a 26-second recording (TTS) that alternates English radio calls and Korean
   - [3.1 60-minute single pass](#31-60-minute-single-pass)
   - [3.2 Speaker diarization and timestamps](#32-speaker-diarization-and-timestamps)
   - [3.3 Hotwords](#33-hotwords)
-  - [3.4 Recognition without a language setting](#34-recognition-without-a-language-setting)
+  - [3.4 Accuracy by language (no language setting)](#34-accuracy-by-language-no-language-setting)
   - [3.5 Code-switching](#35-code-switching)
   - [3.6 The streaming model (VibeVoice-ASR-Streaming)](#36-the-streaming-model-vibevoice-asr-streaming)
+  - [3.7 Numbers](#37-numbers)
 - [4 Recommendations](#4-recommendations)
 - [5 Limits and what we did not measure](#5-limits-and-what-we-did-not-measure)
 - [License](#license)
@@ -82,67 +83,107 @@ uv pip install --python .venv-mlx/bin/python --prerelease=allow "mlx-audio==0.3.
 
 ## Summary
 
-1. On the RTX 4090, a 9-minute recording took 1 min 40 s (RTF 0.18) and a 19-minute one took 4 min 13 s (RTF 0.22), using 17–23 GB of GPU memory. A 39-minute meeting did not fit in 24 GB.
-2. Running the same 10-minute recording with the same script, the 4090 took 80 s and the DGX Spark 367 s, so the 4090 was about 4.6× faster. The original weights do not fit on a 16 GB Mac, but the 4-bit conversion transcribed the same recording in 7 min 9 s, and its text matched the original's by 98%. It did, however, miss 5 of 20 short Korean sentences entirely.
-3. On the DGX Spark, it transcribed a 59-minute recording end to end without cutting it (it took 86 minutes). In a 39-minute meeting with 4 speakers (AMI), it got the number of speakers right; WER was 17.1% with headset audio and 21.4% with a single table microphone.
-4. Hotwords worked well for Korean names and places. CER fell from 0.021 to 0.000 on a lunar-surface report and from 0.056 to 0.016 on landing calls. English radio calls barely changed: English names and places were already right without hotwords, and the wrong numbers and acronyms were not fixed by hotwords.
-5. Without being told the language, it wrote Korean, English and Japanese in their own scripts, and it followed a recording that switched between Korean and English line by line. But English terms inside Korean sentences came out as Hangul transliterations, such as "파워드 디센트" (pawodeu disenteu, for "powered descent"), and giving the terms as hotwords did not change that.
-6. Some numbers in English radio calls came out as Chinese characters, such as "P六十" and "一八零一".
-7. On old radio recordings where speech and noise mix, it repeated one phrase until the output was cut off, and in that case the server returned an empty result with no error. On noise-only recordings it did not make up sentences; it only emitted tags such as `[Noise]`.
-8. The streaming model started streaming text within 0.7–2.3 s. On a real meeting it separated 4 speakers with accuracy close to the non-streaming model, but it merged the four TTS voices of a radio-call recording into one speaker.
+Every result below is a single run except the 4090 processing times (three runs), and most inputs are synthetic (TTS) or read speech. Treat CER differences of 0.01–0.02 as noise.
+
+1. A 24 GB RTX 4090 handled recordings up to 35 minutes; 39 minutes ran out of memory. Sending long recordings back to back to the same server ran out of memory even at 30 minutes ([Section 2](#2-does-it-run-on-my-hardware)).
+2. On the same 10-minute recording, the 4090 was about 4.6× faster than the DGX Spark. A 16 GB Mac runs a 4-bit conversion that wrote nearly the same text, more slowly ([Section 2](#2-does-it-run-on-my-hardware)).
+3. The DGX Spark transcribed a 59-minute recording in one pass and got the speaker count of a 4-person meeting right ([3.1](#31-60-minute-single-pass), [3.2](#32-speaker-diarization-and-timestamps)).
+4. On the same read sentences, English was most accurate, then Chinese, then Korean. Korean and Chinese sometimes lost whole sentences. Whisper large-v3, given the language, lost none of the same sentences and was more accurate on Korean and on noisy audio ([3.4](#34-accuracy-by-language-no-language-setting)).
+5. Hotwords fixed Korean names, in Korean and in English sentences, but did not reliably fix English numbers or acronyms ([3.3](#33-hotwords)).
+6. English terms inside Korean sentences came out transliterated into Hangul even with hotwords; inside Chinese sentences they stayed in English ([3.5](#35-code-switching)).
+7. Number forms were not consistent: words, digits, and in English radio calls even Chinese characters ([3.7](#37-numbers)).
+8. On noisy old radio it repeated one phrase until cut off, and the server then returned an empty result with no error ([Section 5](#5-limits-and-what-we-did-not-measure)).
+9. The streaming model showed first text in 0.7–2.3 s and separated the 4 speakers of a real meeting, but merged four TTS voices into one ([3.6](#36-the-streaming-model-vibevoice-asr-streaming)).
 
 Table 1: Summary by device
 
 | Device | Runs? | Same 10-min recording | Peak memory |
 |---|---|---|---|
 | Apple M2 16GB | The original does not fit. Runs with a 4-bit conversion | 7 min 9 s (RTF 0.71, 4-bit) | 11.4 GB (with swap) |
-| RTX 4090 24GB | Up to 19 min. 39 min ran out of memory | 1 min 20 s (RTF 0.13) | 21.3 GB |
+| RTX 4090 24GB | Up to 35 min. 39 min ran out of memory | 1 min 20 s (RTF 0.13) | 21.3 GB |
 | DGX Spark | Up to 59 min | 6 min 7 s (RTF 0.61) | 21.3 GB (28.1 GB at 59 min) |
 
-The same 10-minute recording is an excerpt of the Artemis II press conference, run once on each device. The 4090 and DGX ran the original with the same script, and their memory is PyTorch's peak. The Mac ran the 4-bit conversion with mlx-audio without hotwords, and its memory is MLX's peak. The 4090 and DGX runs used hotwords, but on the DGX hotwords barely changed the time (366.6 s vs. 369.3 s).
+The same 10-minute recording is an excerpt of the Artemis II press conference, run once on each device (methods and memory measures in Table 3). The Mac ran without hotwords. The 4090 and DGX runs used hotwords, but on the DGX hotwords barely changed the time (366.6 s vs. 369.3 s).
+
+Table 2: Summary by language
+
+| | English | Korean | Chinese |
+|---|---|---|---|
+| Read sentences, clean ([3.4](#34-accuracy-by-language-no-language-setting)) | Missed 0 of 19, CER 0.009 | Missed 3 of 20, CER 0.032 | Missed 2 of 19, CER 0.025 |
+| Read sentences, 5 dB noise | Missed 1 of 19, CER 0.141 | Missed 6 of 20, CER 0.211 | Missed 3 of 19, CER 0.141 |
+| Same sentences, Whisper large-v3 (language set), clean / noise | Missed 0, CER 0.010 / 0.076 | Missed 0, CER 0.013 / 0.070 | Missed 0, CER 0.035 / 0.119 |
+| Names and hotwords ([3.3](#33-hotwords)) | English names right without hotwords. Korean names in English sentences wrong, fixed by hotwords | Names wrong, fixed by hotwords (CER 0.021 → 0.000) | Names right without hotwords. Only the first word of a recording was wrong, possibly unclear audio |
+| English terms in sentences ([3.5](#35-code-switching)) | - | Transliterated into Hangul, even with hotwords | Stayed in English |
+| Numbers ([3.7](#37-numbers)) | Mostly words, dates and times in digits. Some Chinese characters in radio calls | Hangul numerals. Alarm codes came out wrong | Chinese numerals, values right |
+| Long recordings and speakers ([3.1](#31-60-minute-single-pass), [3.2](#32-speaker-diarization-and-timestamps)) | 59 min in one pass. 4 speakers of a meeting right | Tested up to 1 min 21 s only | Not tested |
+
+CER is the mean over transcribed sentences, with non-speech tags such as `[Silence]` removed. Readings are FLEURS sentences, the same content in all three languages, run once on the DGX.
 
 ## 1 Setup
 
-Table 2: Devices
+Table 3: Devices and methods. Look here for how each result was measured.
 
-| Device | Accelerator | Memory | Conditions |
+| Device | How it ran | Memory measure | Results |
 |---|---|---|---|
-| RTX 4090 workstation | 1× RTX 4090 | 24 GB | Shared. Measured through a model-compose server when nothing else was running. Only the 10-minute device-comparison recording used the same script as the DGX |
-| DGX Spark | GB10 | 120 GB unified | Shared. Measured once per condition with a script that calls transformers directly |
-| MacBook (Apple M2) | GPU (Metal, MLX) | 16 GB unified | Measured with other apps open; 8–10 GB of swap was already in use |
+| RTX 4090 (24 GB, shared) | model-compose 0.4.109 server, when nothing else was running | Whole-GPU usage | Table 4 and the maximum-length table in Section 2, Tables 10 (except DGX rows), 11, 13 (Korean rows), 14, the Whisper rows of Table 12, Figures 5, 6, 8 |
+| RTX 4090 | The same direct-call script as the DGX | PyTorch peak | The 4090 row of Table 1, Figure 1 |
+| DGX Spark (GB10, 120 GB unified, shared) | Script that calls transformers directly | PyTorch peak | Tables 1, 5, 9, 16, the original-model values in Table 6, Figures 1–4, 7 |
+| DGX Spark | model-compose 0.4.109 server, when nothing else was running | Not measured | Three-language tests: DGX rows of Tables 10 and 13, VibeVoice rows of Table 12, Table 15 |
+| MacBook (Apple M2, 16 GB unified) | mlx-audio 0.3.0 script (4-bit conversion), with other apps open and 8–10 GB of swap in use | MLX peak | The Mac row of Table 1, Table 6 |
+| MacBook (Apple M2) | The same script wrapped in a model-compose server shell component | Not measured | Table 7, silence/noise tests |
+
+Do not compare values with different memory measures. Whole-GPU usage comes out higher than PyTorch's peak even for the same run.
 
 - Weights: `microsoft/VibeVoice-ASR` revision `d0c9efdb`, bf16, sdpa attention, greedy decoding (temperature 0, beam 1).
-- The Mac alone ran the third-party 4-bit conversion `mlx-community/VibeVoice-ASR-4bit` (revision `a1a15cb6`) with mlx-audio 0.3.0 (mlx 0.32.3). Its times come from a script that loads the model once, so loading (about 5 s) is excluded. Only the Korean-sentence and silence/noise tests went through the model-compose server (0.4.109), with the same script wrapped in a shell component.
-- On the 4090, we started a server with model-compose 0.4.109 and sent requests. The first request after startup (warmup) and model loading (about 23 s) are not counted. The 19-minute recording ran without warmup, since warmup would only have run the same recording once more.
-- The DGX numbers and the 4090 device-comparison numbers were measured by loading the model directly with the same script; memory is PyTorch's peak. The 4090 VRAM in Table 3 is whole-GPU usage, so do not mix it with these values.
+- The Mac alone ran the third-party 4-bit conversion `mlx-community/VibeVoice-ASR-4bit` (revision `a1a15cb6`) with mlx-audio 0.3.0 (mlx 0.32.3). Its times come from a script that loads the model once, so loading (about 5 s) is excluded.
+- On the 4090, we started a server with model-compose 0.4.109 and sent requests. The first request after startup (warmup, on a short recording) and model loading (about 20 s) are not counted. Recordings up to 19 minutes ran three times each. From 25 minutes on, each length ran once on a freshly started server; these inputs are English TTS calls joined and cut to length. Memory grows with recording length, not with content.
+- The comparison model, Whisper large-v3 (revision `06f233fe`), ran once per FLEURS clip on the 4090 through a model-compose 0.4.109 server (Hugging Face driver, default settings), with the language set for each clip.
 - Inputs
   - 15 Apollo 11 recordings: NASA's 1969 transcripts (technical air-to-ground and public-affairs commentary) read by preset voices of Qwen3-TTS CustomVoice. No real astronaut's voice was used or imitated. The Korean and Japanese scripts are edited translations of the originals. We did not use VibeVoice-family TTS, since part of this model's training data is VibeVoice TTS output and that could flatter the results.
+  - For the 4090 length limit: four recordings made by joining these English calls with 0.5 s pauses and cutting them at 25, 30, 35 and 39 minutes. Some passages repeat.
   - AMI meeting ES2004c (4 speakers, 38 min 54 s): public data that recorded the same meeting with headsets (IHM) and a single table microphone (SDM) at once.
   - The Artemis II post-flight press conference (public NASA video, 59 min 24 s) and its first 10 minutes as an excerpt.
   - 1962 Friendship 7 radio clips (public NASA audio, 45 s and 100 s) and noise recordings (silence, white, pink, radio band; 90 s each).
   - Mac only: 20 Korean read sentences from FLEURS (6–14 s each), as recorded and mixed with white noise at 5 dB SNR, twice each. Also 30 s of silence, 60 s of synthetic noise, and a read sentence followed by silence.
+  - DGX, three languages: the same 20 Korean FLEURS sentences on the original model, plus the Chinese (Mandarin) and English readings of the same sentences. FLEURS reads one set of sentences in every language, so all three languages read the same content. One sentence (no. 1888) has digits or Latin letters in its Chinese and English scripts, so those two have 19. Clean and with white noise at 5 dB SNR, once each.
+  - DGX, eight more TTS recordings: Chinese versions of the Korean hotword and code-switching scripts (voices serena and uncle_fu), English sentences with Korean and Chinese names, and the same seven number sentences in Korean, English and Chinese. A language model wrote these scripts. We transcribed every sentence with Whisper to check that the TTS read it as written. Of the sentences Whisper got wrong, the author listened to the Korean ones; the Chinese ones were checked again with a Chinese-specific recognizer (FunASR Paraformer), and no native speaker listened to them.
 - Verdicts: a language model (Claude) read each output next to the reference script twice, independently, and drafted a verdict. It read text only and could not hear the audio. The author confirmed the drafts while listening; 93% of drafts (14 of 15) were kept as written.
-- Scores: CER and WER are computed after removing punctuation, spaces and case. Number forms ("7" vs "seven") are not normalized, so English radio calls score worse than they really are. For English we therefore also report WER with both sides normalized by the Whisper English normalizer.
+- Scores: CER and WER are computed after removing punctuation, spaces and case. Tags the model adds for non-speech, such as `[Silence]`, are removed before scoring; a sentence that came back as tags only is counted as missed. Chinese has no spaces between words, so we report CER only. Number forms ("7" vs "seven") are not normalized, so English radio calls score worse than they really are. For English we therefore also report WER with both sides normalized by the Whisper English normalizer.
 
 ## 2 Does it run on my hardware?
 
-Table 3: RTX 4090 processing time by recording length (one run each)
+Table 4: RTX 4090 processing time by recording length (median of 3 runs)
 
-| Recording | Length | Processing time | RTF | Peak VRAM |
+| Recording | Length | Processing time | Spread of 3 runs | RTF | Peak VRAM |
+|---|---|---|---|---|---|
+| Korean status report | 24.5 s | 2.6 s | 0.1% | 0.11 | 17.4 GB |
+| Korean status report | 1 min 21 s | 9.9 s | 0.4% | 0.12 | 21.4 GB |
+| English launch calls | 2 min 23 s | 22.1 s | 0.5% | 0.15 | 21.5 GB |
+| English powered-descent calls | 5 min 8 s | 38.7 s | 2.7% | 0.13 | 21.5 GB |
+| English landing calls | 9 min 6 s | 1 min 40 s | 1.1% | 0.18 | 22.7 GB |
+| English first-EVA calls | 18 min 58 s | 4 min 13 s | 0.4% | 0.22 | 22.9 GB |
+
+**RTF.** Processing time divided by recording length. Below 1 means it finishes faster than listening to the recording. The model writes the transcript one token at a time, and the longer the recording, the more input each new token has to attend to, so RTF grows. The 9-minute recording took 100 s and the 19-minute one 253 s: about twice the length, 2.5 times the time. 35 minutes took 660 s (RTF 0.31).
+
+- Hotwords barely changed processing time (English descent calls, one run each: 39.7 s → 39.1 s).
+- Three runs of the same recording were within 3% of each other.
+- Spread of 3 runs is (longest − shortest) ÷ median.
+
+**Maximum length.** Recordings made by joining English calls and cutting them to length, each length sent once to a freshly started server.
+
+| Length | Result | Processing time | RTF | Peak VRAM |
 |---|---|---|---|---|
-| Korean status report | 24.5 s | 2.7 s | 0.11 | 17.3 GB |
-| Korean status report | 1 min 21 s | 10.0 s | 0.12 | 21.5 GB |
-| English launch calls | 2 min 23 s | 22.4 s | 0.16 | 21.4 GB |
-| English powered-descent calls | 5 min 8 s | 39.7 s | 0.13 | 21.6 GB |
-| English landing calls | 9 min 6 s | 1 min 40 s | 0.18 | 22.6 GB |
-| English first-EVA calls | 18 min 58 s | 4 min 13 s | 0.22 | 21.6 GB |
+| 25 min | Finished | 6 min 34 s | 0.26 | 22.1 GB |
+| 30 min | Finished | 8 min 49 s | 0.29 | 23.0 GB |
+| 35 min | Finished | 11 min 0 s | 0.31 | 23.0 GB |
+| 39 min | Out of memory | - | - | - |
 
-**RTF.** Processing time divided by recording length. Below 1 means it finishes faster than listening to the recording. The model writes the transcript one token at a time, and the longer the recording, the more input each new token has to attend to, so RTF grows. The 9-minute recording took 100 s and the 19-minute one 253 s: about twice the length, 2.5 times the time.
+These ran on fresh servers, so their VRAM (whole-GPU usage) can come out lower than the 19-minute row of Table 4, which was measured after several requests on the same server.
 
-- Hotwords barely changed processing time (English descent calls: 39.7 s → 39.1 s).
-- The 4090 (24 GB) fit recordings up to 19 minutes. The 39-minute AMI meeting (24.4 GB on the DGX) ran out of memory 14 s after it started, using the same script as the DGX. We did not measure between 19 and 39 minutes.
+- The 4090 (24 GB) fit recordings up to 35 minutes (23.0 GB). At 39 minutes it ran out of memory trying to allocate another 5.0 GB. The limit lies between 35 and 39 minutes.
+- Long recordings sent back to back to the same server fail at shorter lengths. A 30-minute recording sent right after a 25-minute one on the same server ran out of memory, because PyTorch was still holding 3.5 GB it had freed but not released. On a fresh server the same 30 minutes ran to the end.
 
-Table 4: DGX Spark processing time by recording length (direct call, one run each)
+Table 5: DGX Spark processing time by recording length (direct call, one run each)
 
 | Recording | Length | Processing time | RTF | Peak memory |
 |---|---|---|---|---|
@@ -153,22 +194,22 @@ Table 4: DGX Spark processing time by recording length (direct call, one run eac
 
 - On the DGX, the 10-minute recording finished faster than real time, and the 39- and 59-minute recordings took longer than the recordings themselves. We did not measure the lengths in between, so we do not know where it crosses over.
 
-**Same-file comparison.** Tables 3 and 4 use different recordings and different measurement methods, so they cannot be compared across devices. We therefore ran two of the DGX recordings on the 4090 as well, once each, with the same script and settings.
+**Same-file comparison.** Tables 4 and 5 use different recordings and different measurement methods, so they cannot be compared across devices. We therefore ran two of the DGX recordings on the 4090 as well, once each, with the same script and settings.
 
 ![Processing time for the same two recordings: the 10-minute excerpt took 80 s on the RTX 4090 and 6.1 min on the DGX Spark. The 39-minute AMI meeting ran out of memory on the RTX 4090 and took 51.5 min on the DGX Spark](docs/images/en/chart-same-file.png)
 
 Figure 1: Time to transcribe the same recordings on both devices.
 
 - The 10-minute excerpt took 80 s on the 4090 and 367 s on the DGX, about 4.6× faster. Generated tokens per second were 41.5 vs 8.9.
-- The 39-minute meeting ran out of memory on the 4090 14 s after it started. On the DGX it used 24.4 GB and took 51 min 30 s.
-- Peak memory for the 10-minute excerpt was 21.3 GB on both. The transcripts were 98% the same (1,986 vs 1,983 words), so switching devices barely changed what it wrote.
-- On the same 4090, this 10-minute recording (RTF 0.13) was faster than the 9-minute TTS calls in Table 3 (0.18). Both the content and the method (script vs model-compose server) differ, so we could not separate the cause; do not mix the values in Table 3 and Figure 1.
+- The 39-minute meeting ran out of memory on the 4090 14 s after it started. That run came right after the 10-minute excerpt in the same process, but a 39-minute TTS recording alone on a fresh server also ran out of memory. On the DGX it used 24.4 GB and took 51 min 30 s.
+- Peak memory for the 10-minute excerpt was 21.3 GB on both. The transcripts had nearly the same number of words (1,986 vs 1,983).
+- On the same 4090, this 10-minute recording (RTF 0.13) was faster than the 9-minute TTS calls in Table 4 (0.18). Both the content and the method (script vs model-compose server) differ, so we could not separate the cause; do not mix the values in Table 4 and Figure 1.
 
 ### A 16 GB Mac runs it in 4-bit
 
 The 4-bit MLX conversion of the weights is 5.7 GB (the original is 17.3 GB). With it, we transcribed three recordings that the original had also processed and set the results side by side.
 
-Table 5: Apple M2 16GB in 4-bit vs. the original (one run each)
+Table 6: Apple M2 16GB in 4-bit vs. the original (one run each)
 
 | Recording | Length | Mac time | Mac peak memory | Speakers (truth / original / Mac) | WER original | WER Mac |
 |---|---|---|---|---|---|---|
@@ -178,14 +219,14 @@ Table 5: Apple M2 16GB in 4-bit vs. the original (one run each)
 
 All original values are DGX results. The two AMI rows cut the same window out of a single pass over the whole meeting (39 min), and WER is measured as in Section 3.6. The 10-minute excerpt has no reference transcript, so we measured how much the Mac's words differ from the original's DGX output under the same condition (no hotwords). Mac times exclude model loading.
 
-- **The transcripts were nearly the same as the original's.** The 10-minute excerpt was 1,995 vs. 2,009 words, 98% the same. AMI 5 min had WER 0.230 vs. 0.229. For the English meeting and press conference, going to 4-bit barely changed the results.
+- **The transcripts were nearly the same as the original's.** The 10-minute excerpt was 1,995 vs. 2,009 words, and 2% of the words differed (Table 6). AMI 5 min had WER 0.230 vs. 0.229. For the English meeting and press conference, going to 4-bit barely changed the results.
 - **Speaker separation wobbled on a short clip.** On AMI 1 min it merged 4 speakers into 2. On the 5-minute window with the same 4 people, it separated all 4, like the original. On the 10-minute excerpt the original found 9 speakers and the Mac 10.
 - **Short recordings were slower than real time.** The 1-minute clip took 1.5× its length. RTF fell as recordings got longer: 5 minutes took about as long as the recording, and 10 minutes finished in 7 min 9 s, faster than the recording. Without hotwords, the DGX took 6 min 9 s on the same 10 minutes (the 4090 only has a run with hotwords: 1 min 20 s).
 - **Memory grew from 7.7 GB to 11.4 GB with recording length.** 8–10 GB of swap was in use during the runs. Closing other apps may make it faster.
 
 **Short Korean sentences.** We sent 20 Korean read sentences from FLEURS to the model-compose server twice each. Both runs gave identical results.
 
-Table 6: FLEURS Korean, 20 sentences (Mac, 4-bit)
+Table 7: FLEURS Korean, 20 sentences (Mac, 4-bit)
 
 | Condition | Transcribed | Missed entirely | CER of transcribed sentences (median / mean) | Exactly right |
 |---|---|---|---|---|
@@ -193,22 +234,22 @@ Table 6: FLEURS Korean, 20 sentences (Mac, 4-bit)
 | White noise, 5 dB SNR | 13 | 7 | 0.222 / 0.328 | 0 |
 
 - **Transcribed sentences were mostly accurate.** 8 of the 15 clean sentences had no errors apart from spacing and punctuation. Most errors were in foreign proper nouns ("카사블랑카" Casablanca → "가사 블랑카", "듀발" Duval → "쥐발", "피히테" Fichte → "피히트의"). The worst sentence wrote "플리트비체 호수 국립공원은" (Plitvice Lakes National Park) as "플리프 빛의 호소 공익공원은" (CER 0.189).
-- **A missed sentence came back as a single `[Silence]` or `[Music]` tag.** These were read sentences of 8–14 s, and loudness did not explain it: one missed sentence was louder than most of the transcribed ones. Two missed sentences gave the same result when fed to the script directly, without model-compose. We did not run these 20 sentences on the original, so we do not know whether 4-bit is the cause.
+- **A missed sentence came back as a single `[Silence]` or `[Music]` tag.** These were read sentences of 8–14 s, and loudness did not explain it: one missed sentence was louder than most of the transcribed ones. Two missed sentences gave the same result when fed to the script directly, without model-compose. The original (DGX) also missed 3 of the same 20 clean sentences, but only one of them (no. 1879) was the same sentence, so missing whole sentences is not caused by 4-bit alone (Section 3.4).
 - **Noise made it much worse.** Missed sentences rose to 7, and the 13 transcribed ones had a median CER of 0.222. "낭만주의는" (Romanticism) became "남만주 의", and the Plitvice sentence turned into an unrelated one.
 - **It did not invent speech from silence or noise.** 30 s of silence and 60 s of synthetic noise each produced a single `[Silence]`. A read sentence followed by silence was transcribed and then followed only by `[Silence]`. This matches the original's noise test (Section 5).
 
 ## 3 Results by feature
 
-Table 7: Features the official materials highlight
+Table 8: Features the official materials highlight
 
 | Official feature | Our result |
 |---|---|
-| 60-minute single pass | Transcribed 19-minute (4090) and 59-minute (DGX) recordings end to end without cutting them. The 4090 (24 GB) ran out of memory on a 39-minute recording. |
+| 60-minute single pass | Transcribed 35-minute (4090) and 59-minute (DGX) recordings end to end without cutting them. The 4090 (24 GB) ran out of memory on a 39-minute recording. |
 | Speaker diarization and timestamps | Got the speaker count right in a 4-person meeting, with DER 11.3% (headset). A press conference with changing questioners was split into 25 speakers. |
-| Custom hotwords | Korean names and places were fixed; English numbers and acronyms barely changed. |
-| 50+ languages, no language setting | Wrote Korean, English and Japanese in their own scripts. Japanese had more errors, with CER 0.169. |
-| Code-switching | Followed recordings that switch language line by line; English terms inside Korean sentences were transliterated into Hangul. |
-| Streaming (separate checkpoint) | First text came within 1–2 s, and it separated the 4 speakers of a real meeting. It merged four TTS voices into one speaker. |
+| Custom hotwords | Korean names and places were fixed, in Korean and in English sentences. Chinese names were right without them. English numbers and acronyms barely changed. |
+| 50+ languages, no language setting | Wrote Korean, English, Chinese and Japanese in their own scripts. On the same read sentences, English was most accurate, then Chinese, then Korean, and none beat Whisper large-v3 given the language. Japanese had more errors, with CER 0.169. |
+| Code-switching | Followed recordings that switch language line by line. English terms inside Korean sentences were transliterated into Hangul; inside Chinese sentences they stayed in English. |
+| Streaming (separate checkpoint) | First text came within 0.7–2.3 s, and it separated the 4 speakers of a real meeting. It merged four TTS voices into one speaker. |
 
 ### 3.1 60-minute single pass
 
@@ -216,13 +257,13 @@ Table 7: Features the official materials highlight
 
 - **4090, 18 min 58 s EVA calls:** went in whole and was transcribed to the end. The output starts with "Okay, Houston, I'm on the porch.", passes through "That's one small step for man, one giant leap for mankind." and ends with "We've got this view, Neil." No phrase was repeated.
 - **DGX, 59 min 24 s Artemis II post-flight press conference:** 230 segments and about 10,800 words, with the last segment running to the end of the recording (59:23). Music and room noise at the start and end were tagged separately as `[Music]` and `[Environmental Sounds]`. Peak memory was 28.1 GB.
-- **4090, 38 min 54 s AMI meeting:** ran out of memory right after it started. Putting a recording close to 60 minutes through in one pass needs more than 24 GB of memory.
+- **4090, 38 min 54 s AMI meeting:** ran out of memory right after it started. On the 4090, joined TTS calls ran to the end up to 35 minutes and ran out of memory at 39 (Section 2). Putting a recording close to 60 minutes through in one pass needs more than 24 GB of memory.
 
 ### 3.2 Speaker diarization and timestamps
 
 The 4090 runs were set to return only the transcript text, so they did not measure speakers or times. The results below come from the DGX with segment output on.
 
-Table 8: AMI meeting ES2004c (4 speakers, 38 min 54 s), recorded with two kinds of microphone at once.
+Table 9: AMI meeting ES2004c (4 speakers, 38 min 54 s), recorded with two kinds of microphone at once.
 
 | Metric (%, lower is better) | Headset | Table mic | Paper, headset | Paper, table mic |
 |---|---|---|---|---|
@@ -236,7 +277,7 @@ Table 8: AMI meeting ES2004c (4 speakers, 38 min 54 s), recorded with two kinds 
 
 Figure 2 (DGX): Error rates for the same meeting recorded with different microphones.
 
-- In a meeting where the same 4 people talked for all 39 minutes, both microphones got the speaker count right. tcpWER was only 0.2–0.6 pp above cpWER, so the times were mostly right too.
+- In a meeting where the same 4 people talked for all 39 minutes, both microphones got the speaker count right. tcpWER was only 0.2–0.6 pp above cpWER, so the times were right at least to within the metric's ±5 s window.
 
 ![Speaker timeline of a 4-person meeting: for each speaker, the top lane is the reference and the bottom lane is the model, and they are filled at nearly the same times](docs/images/en/speakers-ami.png)
 
@@ -261,26 +302,31 @@ We ran each recording once without and once with hotwords.
 
 Figure 5 (4090): Before and after hotwords. Differences in spacing and commas are not marked, matching how scores are computed.
 
-Table 9: Score changes with and without hotwords (4090)
+Table 10: Score changes with and without hotwords (4090; rows marked DGX ran on the DGX)
 
 | Recording | Hotwords | CER | WER |
 |---|---|---|---|
 | Korean lunar-surface report | 닐, 버즈, 메사, 비상 시료, 휴스턴 (Neil, Buzz, mesa, contingency sample, Houston) | 0.021 → **0.000** | 0.278 → 0.056 |
 | Korean landing calls | 이글, 컬럼비아, 트랭퀼리티 베이스, 프로그램 알람, 동력 하강 (Eagle, Columbia, Tranquility Base, program alarm, powered descent) | 0.056 → **0.016** | 0.184 → 0.053 |
 | English powered-descent calls | Eagle, Columbia, Tranquility Base, DELTA-H, PGNS, AGS, P64 | 0.387 → 0.390 | 0.376 → 0.357 |
+| Chinese lunar-surface report (DGX) | 尼尔, 巴兹, 台地, 应急样本, 休斯敦 (Neil, Buzz, mesa, contingency sample, Houston) | 0.027 → **0.000** | - |
+| Chinese landing calls (DGX) | 鹰号, 哥伦比亚号, 静海基地, 程序警报, 动力下降 (Eagle, Columbia, Tranquility Base, program alarm, powered descent) | 0.022 → 0.022 | - |
+| English sentences with Korean and Chinese names (DGX) | Yi So-yeon, Nuri, Naro Space Center, Goheung, Danuri, Yang Liwei, Jiuquan, Wang Yaping, Zhai Zhigang, Tiangong, Chang'e, Tianwen, Wenchang | 0.058 → 0.024 | 0.131 → 0.048 |
 
 Measured again with WER that also normalizes number forms, the English descent calls went from 22.6% to 20.3%, a small drop.
 
 - **In the Korean lunar-surface report, hotwords got every name right.** Without them, "닐, 지금 메사 쪽" ("Neil, toward the mesa now") came out as "네, 지금 매사 쪽" ("Yes, now everything …"). With hotwords, "닐" (Neil) and "메사" (mesa) matched the script. "버즈" (Buzz) and "비상 시료" (contingency sample) were already right without hotwords (only the spacing differed, "비상시료").
 - **The Korean landing calls were only partly fixed.** "슈스턴" became "휴스턴" (Houston) and "콜럼비아" became "컬럼비아" (Columbia), but "트랭퀼리티 베이스" (Tranquility Base), which was on the list, came out as "트랭큘리티 베이스".
 - **The English descent calls barely changed.** "Eagle" (9 times) and "Tranquility Base" already matched the script without hotwords, so there was nothing to fix. The errors were in numbers and acronyms. "Both odd" (both AUTO) and "Fuel stand is in" (413 is in) were the same with or without hotwords. Among the listed acronyms, "AGS" became correct, and "P64" was right in only one of two places (the other was "P六十" without hotwords and "P60" with them).
+- **In Chinese, only the first word of each recording was wrong, and that may be the audio.** Without hotwords, the opening "尼尔" (Neil) came out as "你啊" ("you, ah") and the opening "鹰号" (Eagle) as "你好" ("hello"); with hotwords, "尼尔" was fixed but "鹰号" became "调好" ("tuned"). The same names later in the recordings were right. Whisper and a Chinese-specific recognizer (Paraformer) also misheard the opening "鹰号" (as "也好" and "您好"), so the first syllable of the TTS audio may be unclear there, and we do not count that "鹰号" error as a model error. "尼尔" was not like this: hotwords fixed it. Every other Chinese name and term, such as "静海基地" (Tranquility Base), was right without hotwords.
+- **In English sentences, Korean names were wrong and Chinese names mostly right.** Without hotwords, "Yi So-yeon" came out as "Yusou Yan", "Goheung" as "Gohang" and "Danuri" as "The Nuri"; with hotwords all three matched. Of the Chinese names, "Yang Liwei", "Zhai Zhigang", "Jiuquan" and "Wenchang" were right without hotwords and "Wang Yaping" ("Wang Yebing") was fixed by them. "Chang'e" came out as "Qinghai" with or without hotwords.
 - Hotwords did not increase processing time.
 
-### 3.4 Recognition without a language setting
+### 3.4 Accuracy by language (no language setting)
 
 > Model card: "It supports over 50 languages, requires no explicit language setting, and natively handles code-switching within and across utterances."
 
-Table 10: Scores by language (4090, no language setting)
+Table 11: Scores by language (4090, no language setting)
 
 | Recording | CER | WER |
 |---|---|---|
@@ -291,19 +337,51 @@ Table 10: Scores by language (4090, no language setting)
 
 \* The reference has no spaces between words, so do not read this as a word-level metric.
 
-- **Nothing was translated or written in the wrong script.** Korean came out in Hangul, English in Latin letters, and Japanese in hiragana, katakana and kanji.
+- **Nothing was translated or written in the wrong script.** Korean came out in Hangul, English in Latin letters, Chinese in simplified characters (no traditional characters in any Chinese output), and Japanese in hiragana, katakana and kanji.
 - **Japanese was recognized as Japanese, but with many word errors.** "アポロ管制センター" (Apollo control center) came out as "アポロ厳正センター", and "乗組員" (crew) as "ノグミン".
 - The Korean script's "이십일 시간 삼십팔 분" (twenty-one hours thirty-eight minutes, spelled out) came out in digits, "21시간 38분". The same countdown came out as "10, 9, 8" in one run and "Ten, nine, eight" in another, so number forms are not consistent.
-- We checked only Korean, English and Japanese. Of the training data, 66.7% is English, 14.4% Chinese and 0.9% Korean (paper appendix).
+
+**The same sentences in three languages.** FLEURS has people read one set of sentences in every language, so we took the 20 Korean sentences from Section 2 and the Chinese and English readings of the same sentences, and ran them on the original model (DGX). For comparison, the same clips also went through Whisper large-v3 with the language set (4090). Each language has different readers, so only the content is the same.
+
+Table 12: FLEURS read sentences in three languages (one run each; VibeVoice original model on the DGX, Whisper large-v3 with the language set on the 4090)
+
+| Language | Audio | Model | Missed entirely | CER of transcribed sentences (median / mean) | Exactly right | WER (mean) |
+|---|---|---|---|---|---|---|
+| English (19) | Clean | VibeVoice | 0 | 0.000 / 0.009 | 14 | 0.023 |
+| English (19) | Clean | Whisper | 0 | 0.000 / 0.010 | 13 | 0.032 |
+| Chinese (19) | Clean | VibeVoice | 2 | 0.000 / 0.025 | 10 | - |
+| Chinese (19) | Clean | Whisper | 0 | 0.000 / 0.035 | 10 | - |
+| Korean (20) | Clean | VibeVoice | 3 | 0.021 / 0.032 | 7 | 0.144 |
+| Korean (20) | Clean | Whisper | 0 | 0.000 / 0.013 | 16 | 0.097 |
+| English (19) | White noise, 5 dB SNR | VibeVoice | 1 | 0.064 / 0.141 | 6 | 0.226 |
+| English (19) | White noise, 5 dB SNR | Whisper | 0 | 0.010 / 0.076 | 9 | 0.115 |
+| Chinese (19) | White noise, 5 dB SNR | VibeVoice | 3 | 0.112 / 0.141 | 3 | - |
+| Chinese (19) | White noise, 5 dB SNR | Whisper | 0 | 0.042 / 0.119 | 8 | - |
+| Korean (20) | White noise, 5 dB SNR | VibeVoice | 6 | 0.176 / 0.211 | 1 | 0.380 |
+| Korean (20) | White noise, 5 dB SNR | Whisper | 0 | 0.048 / 0.070 | 7 | 0.231 |
+
+Korean WER counts space-separated words (eojeol), so do not compare it with English WER.
+
+- **On the same sentences, Whisper large-v3 did better.** Given the language, Whisper missed no sentence in any of the three languages. On Korean it led even on clean audio (mean CER 0.013 vs 0.032, 16 vs 7 sentences exactly right), and with noise it degraded less in all three languages. Clean English and Chinese differ by under 0.01, so we read them as the same. VibeVoice's CER leaves out the sentences it missed; counting them would widen the gap.
+- **The comparison favors Whisper.** Whisper was told the language; VibeVoice has no such setting. We also tried Whisper without a language, but every request failed in model-compose 0.4.109 ("mel input features ... length 3000"), so it is not measured. The comparison covers only 6–14 s read sentences; features Whisper lacks, such as one-pass long recordings, speaker diarization and hotwords, were not compared. Whisper used 4.1 GB of GPU memory on these clips (VibeVoice: 17.4 GB on a 24.5 s recording, Table 4).
+- **The order matches the training-data shares.** With clean audio, English was most accurate, then Chinese, then Korean. Of the training data, 66.7% is English, 14.4% Chinese and 0.9% Korean (paper appendix). With about 20 sentences per language read by different people, the gap between Chinese and Korean (CER 0.025 vs 0.032) may be noise; English's lead is clearer. With noise, every language got worse, Korean the most.
+- **Whole sentences went missing in Chinese and Korean too.** A missed sentence came back as `[Silence]` only. Sentence no. 1755 was missed in both Korean and Chinese, but its English reading was transcribed. Loudness did not explain it: the Chinese reading of no. 1755 was louder than most transcribed sentences.
+- **`[Silence]` tags were attached far more often in Korean and Chinese.** 33 of 40 Korean outputs and 25 of 38 Chinese outputs had a tag, usually `[Silence]` at the end, against 3 of 38 in English. The Korean and Chinese recordings have about 2 s of silence before and after the speech and the English ones about 0.7 s, so this may come from the recordings rather than the language. Remove these tags before showing or scoring the text: left in, a word-for-word correct Chinese transcript (no. 1660) scored CER 0.22.
+- Besides these three and Japanese, we did not test any of the other 50+ languages.
 
 ### 3.5 Code-switching
 
-Table 11: Code-switching recordings (4090)
+Table 13: Code-switching recordings (Korean on the 4090, Chinese on the DGX)
 
 | Recording | CER | Result |
 |---|---|---|
 | English original and Korean interpretation alternating line by line | 0.010 | Wrote English lines in English and Korean lines in Hangul, in order. Only "트랭퀼리티 베이스" (Tranquility Base) was wrong, as "트랜클리티 베이스" |
 | English terms inside Korean sentences | 0.648 | Every English term was transliterated into Hangul, and some changed meaning |
+| English original and Chinese interpretation alternating line by line | 0.000 | Wrote English lines in English and Chinese lines in Chinese, in order |
+| English terms inside Chinese sentences | 0.000 | Every English term stayed in English. Only capitals were lost ("GO" → "go", "Eagle" → "eagle") |
+| Same, with the terms as hotwords | 0.000 | Capitals matched the script too ("GO", "Eagle", "Tranquility Base") |
+
+The Chinese recordings are the Korean scripts translated, with the same ten English terms in the same places.
 
 English terms inside Korean sentences came out like this.
 
@@ -319,7 +397,9 @@ English terms inside Korean sentences came out like this.
 
 Figure 6 (4090): Code-switching briefing. The bottom row is the follow-up run with the English terms given as hotwords.
 
-**Follow-up: does a term list keep the terms in English?** We ran the same recording again with "Eagle, Tranquility Base, powered descent, landing radar, lock-on, program alarm, GO, manual attitude control, contact light, engine stop" as hotwords. Still not one term came out in Latin letters, and CER stayed at 0.648. Only the spellings shifted a little ("레다라가 로군" → "레이더라가 로건", "얼람" → "알람"). In sentences that are mainly Korean, a term list could not change which script the terms were written in. We did not measure the opposite direction (Korean words inside English sentences).
+**Follow-up: does a term list keep the terms in English?** We ran the same recording again with "Eagle, Tranquility Base, powered descent, landing radar, lock-on, program alarm, GO, manual attitude control, contact light, engine stop" as hotwords. Still not one term came out in Latin letters, and CER stayed at 0.648. Only the spellings shifted a little ("레다라가 로군" → "레이더라가 로건", "얼람" → "알람"). In sentences that are mainly Korean, a term list could not change which script the terms were written in.
+
+**Chinese kept the English terms.** The same terms inside Chinese sentences came out in Latin letters, such as "现在开始进入 powered descent" and "landing radar 已经 lock on". The transliteration happened only in Korean sentences. For the opposite direction (other languages inside English sentences), we measured only Korean and Chinese names (Section 3.3).
 
 ### 3.6 The streaming model (VibeVoice-ASR-Streaming)
 
@@ -327,7 +407,7 @@ Figure 6 (4090): Code-switching briefing. The bottom row is the follow-up run wi
 
 The streaming model listens to the recording in chunks (2.9 s) and emits text as it goes. In model-compose, setting the workflow output to `${output as stream/text}` and the action to `streaming: true` makes the result flow out chunk by chunk. We ran the 7B (revision `60d858b5`) once each on four recordings (RTX 4090).
 
-Table 12: Streaming 7B (4090, one run each)
+Table 14: Streaming 7B (4090, one run each)
 
 | Recording | Actual speakers | Streaming speakers | First text | Done | WER streaming | WER non-streaming |
 |---|---|---|---|---|---|---|
@@ -344,15 +424,36 @@ These WERs only normalize punctuation and case, so do not compare them directly 
 - **It merged the four TTS voices into one speaker.** The transcription was accurate (WER 0.035), but every line was Speaker 0. We did not check why it separated real people but not the TTS voices.
 - We did not measure the 1.5B.
 
+### 3.7 Numbers
+
+The same seven number sentences (a date and time, a countdown, alarm codes 1202 and 1201, a decimal, an amount, a weight) were read in Korean, English and Chinese, one voice each, and run once on the DGX. The TTS read every number as words, so the table shows how the model chose to write what it heard.
+
+Table 15: How numbers were written (DGX)
+
+| Spoken | Korean output | English output | Chinese output |
+|---|---|---|---|
+| July 20, 1969, 4:17 p.m. | 천구백육십구년 칠월 이십일 오후 네시 십칠분 (words) | July 20th, 1969, at 4:17 p.m. (digits) | 一九六九年七月二十日下午四点十七分 (numerals) |
+| Countdown 10 … 0 | 십구 팔 칠 … 영 ("10, 9" merged into "19") | Ten, nine, eight … zero | 十、九、八 … 零 |
+| Alarm 1202, then 1201 | 일이공, 일이공에 (both wrong) | twelve o two, twelve o one | 一二零二, 一二零一 |
+| 4.5 feet per second | 사점오피트 | four point five feet | 四点五英尺 |
+| $25.4 billion | 이백오십사억 달러 | twenty five point four billion dollars | 二百五十四亿美元 |
+
+- **The model wrote what it heard, mostly as words.** Only the English date and time came out in digits. Elsewhere it chose digits even for numbers read as words: a Korean "이십일 시간 삼십팔 분" came out as "21시간 38분" (Section 3.4). Do not expect one form.
+- **The values were right except for Korean alarm codes.** "일이공이" (1-2-0-2) came out as "일이공" and "일이공일" (1-2-0-1) as "일이공에", and the Korean countdown merged "십, 구" (ten, nine) into "십구" (nineteen). English and Chinese got every value right.
+- No Chinese characters appeared in these English sentences, unlike the English radio calls in Section 5.
+- Even with the right values, these outputs score badly against a reference written in digits (CER 0.37–0.63), so normalize number forms before measuring accuracy.
+
 ## 4 Recommendations
 
-- **Hardware:** A 24 GB GPU handles recordings of about 20 minutes, but a 39-minute meeting ran out of memory. Run longer recordings on a device with more memory (28.1 GB at 59 minutes). On the DGX Spark, from 39 minutes on, processing took longer than the recording, and the 4090 finished the same recording about 4.6× faster.
-- **16 GB Mac:** The 4-bit conversion (mlx-audio) runs, and on a 10-minute English recording it produced nearly the same text as the original in a little over 7 minutes. It works for transcribing recordings ahead of time but is too slow for live captions. Short Korean recordings can come back entirely empty (`[Silence]`), so when that happens, listen to the recording again before trusting it.
-- **Meeting notes:** If you need speakers, get segment output with `return_timestamps: true`. A meeting recorded with a single laptop has about 4 pp higher WER than with headsets, and speaker attribution is shakier.
-- **Hotwords:** Put names, places and in-house terms in hotwords. They did not add processing time and fixed Korean proper nouns. English numbers and acronyms (calls like P64 and AGS) were not reliably fixed, so have a person check them.
-- **Code-switching:** If you need English terms in Korean speech written in English, keep a separate dictionary that maps the transliterations back ("파워드 디센트" → "powered descent"). This model did not write them in Latin letters even with a term list.
-- **Numbers:** The same number can come out as Arabic digits, English words or Chinese characters. Normalize them in post-processing when numbers matter, and normalize number forms before measuring accuracy.
-- **Streaming:** When you need results right away, such as live captions during a meeting, use the streaming model. On the 4090 the first text came within 1–2 s and it separated the speakers of a real meeting. When you need the time of each line, give the non-streaming model the whole recording.
+- **Hardware:** A 24 GB GPU fits recordings up to 35 minutes; 39 minutes ran out of memory. A server that takes long recordings back to back runs out at shorter lengths (30 minutes failed right after 25). Run recordings over 39 minutes on a device with more memory (28.1 GB at 59 minutes). On the DGX Spark, from 39 minutes on, processing took longer than the recording. On a 10-minute recording, the 4090 was about 4.6× faster than the DGX Spark.
+- **16 GB Mac:** The 4-bit conversion (mlx-audio) runs, and on a 10-minute English recording it produced nearly the same text as the original in a little over 7 minutes. It works for transcribing recordings ahead of time but is too slow for live captions. Short Korean recordings can come back entirely empty (`[Silence]`); the original model does this too, so when that happens, listen to the recording again before trusting it.
+- **Meeting notes:** If you need speakers, get segment output with `return_timestamps: true`. In our one meeting, a single table microphone (close to recording with one laptop) raised WER by about 4 pp over headsets, and speaker attribution was shakier.
+- **Hotwords:** Put names, places and in-house terms in hotwords. They did not add processing time and fixed Korean proper nouns, including Korean names inside English sentences. English numbers and acronyms (calls like P64 and AGS) were not reliably fixed, so have a person check them.
+- **Code-switching:** In Chinese, English terms stay in English, and a term list also fixes their capitals. In Korean, if you need English terms written in English, keep a separate dictionary that maps the transliterations back ("파워드 디센트" → "powered descent"); this model did not write them in Latin letters even with a term list.
+- **Non-speech tags:** Outputs often end with `[Silence]` or similar tags, especially on recordings with silence before and after the speech. Strip them before display or scoring, and treat an output that is tags only as "missed", not "nobody spoke".
+- **Numbers:** The same number can come out as Arabic digits, words in the spoken language (Hangul or Chinese numerals, English words) or Chinese characters. Normalize them in post-processing when numbers matter, and normalize number forms before measuring accuracy.
+- **Short recordings only:** If you do not need speakers, one-pass long recordings or hotwords, try Whisper large-v3 as well. On the same read sentences, Whisper given the language missed no sentence, was more accurate on Korean and on noisy audio, and used about a quarter of the GPU memory.
+- **Streaming:** When you need results right away, use the streaming model. We fed it files only, so try it with live microphone input before using it for live captions. On the 4090 the first text came within 0.7–2.3 s and it separated the speakers of a real meeting. When you need the time of each line, give the non-streaming model the whole recording.
 - **Old radio and noisy recordings:** A repetition loop can leave the result completely empty (Section 5). Do not read an empty result as "nobody spoke"; check the raw output, or set a token limit and a repetition check.
 
 ## 5 Limits and what we did not measure
@@ -369,7 +470,7 @@ After that, in a noisy stretch, it repeated one phrase over and over ("Roger, tu
 
 Figure 7 (DGX): Repetition loop and empty result.
 
-Table 13: Variables we changed (DGX)
+Table 16: Variables we changed (DGX)
 
 | Variable | Values | Result |
 |---|---|---|
@@ -391,16 +492,13 @@ With noise alone it did not make up sentences; the loops appeared when speech an
 
 Figure 8 (4090): Chinese numerals in English radio calls. 1201 came out as 一八零一 (1801), so even the value was wrong.
 
-- **"Tranquility Base" was spelled differently in Hangul every time.** All four outputs differed: "트랜킬리티 페이스", "트랭큘리티 베이스", "트랜클리티 베이스" and "트랜킬리티 베이스", and hotwords did not pin it down.
-
-![Tranquility Base written four ways in four outputs: 트랜킬리티 페이스, 트랭큘리티 베이스, 트랜클리티 베이스, 트랜킬리티 베이스](docs/images/en/card-tranquility.png)
-
-Figure 9 (4090): Four spellings of the same place name.
+- **Korean transliterations of English place names were not stable.** "Tranquility Base" came out in four different Hangul spellings across four outputs, and hotwords did not pin it down (transliteration: Section 3.5).
 
 - **The same input twice gives nearly the same output.** A 1-minute Korean recording gave identical results both times, and a 3-minute English recording differed in one punctuation mark out of 394 words ("inch. But" vs "inch, but").
-- **Each condition was measured once.** We do not know how much speed varies.
-- **The Mac results come from a third-party 4-bit conversion.** We compared it with the original on three English recordings only, and did not check whether the original also misses whole Korean sentences. We measured with other apps open and swap in use, and did not test hotwords, code-switching or streaming on the Mac.
-- **Not measured:** the other 47 of the 50+ languages (including Chinese), Korean words inside English sentences, the streaming 1.5B, live microphone input, the longest recording that fits on a 4090 (between 19 and 39 minutes), the speed of other inference engines such as vLLM, and a quantitative evaluation of overlapping speech.
+- **Most conditions were measured once.** Only the 4090 processing times (up to 19 minutes) ran three times, and the three runs were within 3%. Each length in the maximum-length test ran once.
+- **The Mac results come from a third-party 4-bit conversion.** We compared it with the original on three English recordings and the 20 Korean sentences (the original missed 3, the Mac 5). We measured with other apps open and swap in use, and did not test hotwords, code-switching or streaming on the Mac.
+- **Chinese was tested on read sentences and TTS only.** We have no real Chinese conversation or meeting, so Chinese speaker diarization and long recordings are untested. The new three-language tests ran once each on the DGX, and their scripts were written by a language model.
+- **Not measured:** comparisons with other models beyond short read sentences (Whisper and others on long recordings, meetings or hotwords), Whisper without a language set, the rest of the 50+ languages, Korean common words (not names) inside English sentences, the streaming 1.5B, live microphone input, the exact longest recording that fits on a 4090 (between 35 and 39 minutes), the speed of other inference engines such as vLLM, and a quantitative evaluation of overlapping speech.
 
 ## License
 
@@ -408,12 +506,13 @@ Figure 9 (4090): Four spellings of the same place name.
 |---|---|---|
 | `microsoft/VibeVoice-ASR` weights | [MIT](https://huggingface.co/microsoft/VibeVoice-ASR/blob/main/LICENSE) | ✓ |
 | `microsoft/VibeVoice-ASR-Streaming-7B` weights | [MIT](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-7B) | ✓ |
+| `openai/whisper-large-v3` weights (comparison) | [Apache 2.0](https://huggingface.co/openai/whisper-large-v3) | ✓ |
 | Apollo 11 transcripts (input scripts) | U.S. federal government work, public domain | ✓ |
 | [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) | CC BY 4.0 | ✓ (with attribution) |
 | Public NASA video and audio (Artemis II press conference, Friendship 7 radio) | U.S. federal government work. Used only for measurement and not included in this repository | ✓ |
 | [Qwen3-TTS CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) (input speech synthesis) | Apache 2.0 | ✓ |
 | `mlx-community/VibeVoice-ASR-4bit` conversion (for Mac) | [MIT](https://huggingface.co/mlx-community/VibeVoice-ASR-4bit) | ✓ |
-| [FLEURS](https://huggingface.co/datasets/google/fleurs) Korean (Mac test input) | CC BY 4.0. Used for measurement only, not included in this repo | ✓ (with attribution) |
+| [FLEURS](https://huggingface.co/datasets/google/fleurs) Korean, Chinese and English (read-sentence input) | CC BY 4.0. Used for measurement only, not included in this repo | ✓ (with attribution) |
 
 - This project is released under the MIT License.
 - Microsoft does not recommend using VibeVoice in commercial or real-world applications without further testing and development.
